@@ -134,7 +134,7 @@ The paper highlights four main ablations:
 - Very high temperature hurts RMSE and CRPS
 - The paper reports **tau = 1.3** as the best balance
 
-## My Understanding of the Model Pipeline
+## Model Pipeline
 
 The implementation in `omnicast/omnicast.py` follows the same high-level two-stage pipeline described in the paper.
 
@@ -238,25 +238,3 @@ Examples of paper-vs-demo differences already called out in the code:
 - paper: **44** future frames; demo: **6**
 - paper transformer depth: **16/16**; demo: **2/2**
 - paper diffusion steps: **1000 train / 100 infer**; demo: **100 / 20**
-
-## Practical Interpretation
-
-If you are reading this implementation to understand OmniCast conceptually, the main story is:
-
-- encode weather fields into compact continuous latent tokens
-- train a masked transformer to reason over the whole future sequence at once
-- use diffusion only for the masked latent tokens
-- generate forecasts by iterative unmasking rather than purely autoregressive rollout
-
-That design is what allows the paper to claim:
-
-- strong **medium-range probabilistic forecasting**
-- especially strong **S2S forecasting**
-- better **physical consistency**
-- much better **sampling efficiency**
-
-## Notes
-
-- The evaluation summary above reflects the **paper's reported results**, not results reproduced by the code in this repository
-- The arXiv HTML rendering exposes the qualitative findings clearly, but some exact numeric figure values are embedded in plots rather than accessible as clean text
-- For exact plots and full appendix details, read the paper directly: https://arxiv.org/abs/2510.18707
