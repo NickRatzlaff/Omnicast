@@ -3,7 +3,7 @@ from typing import Tuple
 
 import torch
 
-from omnicast import omnicast_builder
+from omnicast.omnicast import omnicast_builder
 
 
 def parse_args() -> argparse.Namespace:
