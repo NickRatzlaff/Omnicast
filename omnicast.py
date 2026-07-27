@@ -22,13 +22,12 @@ Dependencies: torch, einops (pip install torch einops)
 """
 
 import math
-import random
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from einops import rearrange, repeat
+from einops import rearrange
 
 
 # =============================================================================
@@ -36,62 +35,71 @@ from einops import rearrange, repeat
 # =============================================================================
 
 class ResBlock(nn.Module):
-    """Residual block used in the UNet encoder/decoder."""
+    """PDEArena/LDM-style residual block used by the paper's VAE."""
     def __init__(self, in_ch: int, out_ch: int, dropout: float = 0.0):
         super().__init__()
+        self.norm1 = nn.GroupNorm(min(32, in_ch), in_ch, eps=1e-6)
         self.conv1 = nn.Conv2d(in_ch, out_ch, 3, padding=1)
-        self.conv2 = nn.Conv2d(out_ch, out_ch, 3, padding=1)
-        self.norm1 = nn.GroupNorm(min(32, out_ch), out_ch)
-        self.norm2 = nn.GroupNorm(min(32, out_ch), out_ch)
+        self.norm2 = nn.GroupNorm(min(32, out_ch), out_ch, eps=1e-6)
         self.dropout = nn.Dropout(dropout)
+        self.conv2 = nn.Conv2d(out_ch, out_ch, 3, padding=1)
         self.skip = nn.Conv2d(in_ch, out_ch, 1) if in_ch != out_ch else nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = F.silu(self.norm1(self.conv1(x)))
-        h = self.dropout(h)
-        h = F.silu(self.norm2(self.conv2(h)))
+        h = self.conv1(F.silu(self.norm1(x)))
+        h = self.conv2(self.dropout(F.silu(self.norm2(h))))
         return h + self.skip(x)
 
 
 class DownBlock(nn.Module):
-    """Encoder block: ResBlocks + spatial downsampling (stride-2 conv)."""
-    def __init__(self, in_ch: int, out_ch: int, n_blocks: int = 2, dropout: float = 0.0):
+    """One VAE encoder resolution level, optionally followed by 2x downsampling."""
+    def __init__(
+        self,
+        in_ch: int,
+        out_ch: int,
+        n_blocks: int = 2,
+        dropout: float = 0.0,
+        downsample: bool = True,
+    ):
         super().__init__()
         self.blocks = nn.ModuleList()
         for i in range(n_blocks):
             self.blocks.append(ResBlock(in_ch if i == 0 else out_ch, out_ch, dropout))
-        self.downsample = nn.Conv2d(out_ch, out_ch, 3, stride=2, padding=1)
+        self.downsample = (
+            nn.Conv2d(out_ch, out_ch, 3, stride=2, padding=0)
+            if downsample else None
+        )
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         for block in self.blocks:
             x = block(x)
-        return self.downsample(x), x  # (downsampled, skip)
+        if self.downsample is not None:
+            x = self.downsample(F.pad(x, (0, 1, 0, 1)))
+        return x
 
 
 class UpBlock(nn.Module):
-    """Decoder block: upsample + concatenate skip + ResBlocks."""
-    def __init__(self, in_ch: int, skip_ch: int, out_ch: int, n_blocks: int = 2, dropout: float = 0.0):
+    """One latent-only VAE decoder level, optionally followed by 2x upsampling."""
+    def __init__(
+        self,
+        in_ch: int,
+        out_ch: int,
+        n_blocks: int = 3,
+        dropout: float = 0.0,
+        upsample: bool = True,
+    ):
         super().__init__()
-        self.skip_ch = skip_ch
-        self.upsample = nn.ConvTranspose2d(in_ch, in_ch, 4, stride=2, padding=1)
         self.blocks = nn.ModuleList()
         for i in range(n_blocks):
-            ch_in = (in_ch + skip_ch) if i == 0 else out_ch
-            self.blocks.append(ResBlock(ch_in, out_ch, dropout))
+            self.blocks.append(ResBlock(in_ch if i == 0 else out_ch, out_ch, dropout))
+        self.upsample = nn.Conv2d(out_ch, out_ch, 3, padding=1) if upsample else None
 
-    def forward(self, x: torch.Tensor, skip: Optional[torch.Tensor] = None) -> torch.Tensor:
-        x = self.upsample(x)
-        if skip is not None:
-            # Handle potential size mismatch from odd spatial dims
-            if x.shape[2:] != skip.shape[2:]:
-                x = F.interpolate(x, size=skip.shape[2:], mode='bilinear', align_corners=False)
-            x = torch.cat([x, skip], dim=1)
-        else:
-            # No skip connection — pad with zeros for standalone decoding
-            zeros = torch.zeros(x.shape[0], self.skip_ch, x.shape[2], x.shape[3], device=x.device)
-            x = torch.cat([x, zeros], dim=1)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         for block in self.blocks:
             x = block(x)
+        if self.upsample is not None:
+            x = F.interpolate(x, scale_factor=2.0, mode="nearest")
+            x = self.upsample(x)
         return x
 
 
@@ -124,27 +132,53 @@ class WeatherVAE(nn.Module):
         self.latent_dim = latent_dim
         channels = [base_channels * m for m in channel_mults]
 
-        # Encoder
+        # Encoder: one level per multiplier and four downsampling operations.
         self.enc_in = nn.Conv2d(in_channels, channels[0], 3, padding=1)
         self.enc_blocks = nn.ModuleList()
-        for i in range(len(channels) - 1):
-            self.enc_blocks.append(DownBlock(channels[i], channels[i + 1], n_blocks, dropout))
-        # Bottleneck → mean and logvar
-        self.enc_mid = ResBlock(channels[-1], channels[-1], dropout)
-        self.to_mu = nn.Conv2d(channels[-1], latent_dim, 1)
-        self.to_logvar = nn.Conv2d(channels[-1], latent_dim, 1)
+        in_ch = channels[0]
+        for i, out_ch in enumerate(channels):
+            self.enc_blocks.append(
+                DownBlock(
+                    in_ch,
+                    out_ch,
+                    n_blocks,
+                    dropout,
+                    downsample=i < len(channels) - 1,
+                )
+            )
+            in_ch = out_ch
+        self.enc_mid = nn.Sequential(
+            ResBlock(channels[-1], channels[-1], dropout),
+            ResBlock(channels[-1], channels[-1], dropout),
+        )
+        self.enc_out = nn.Sequential(
+            nn.GroupNorm(min(32, channels[-1]), channels[-1], eps=1e-6),
+            nn.SiLU(),
+            nn.Conv2d(channels[-1], 2 * latent_dim, 3, padding=1),
+        )
 
-        # Decoder
-        self.dec_in = nn.Conv2d(latent_dim, channels[-1], 1)
-        self.dec_mid = ResBlock(channels[-1], channels[-1], dropout)
+        # Generated weather states must be decoded from z alone, without skips.
+        self.dec_in = nn.Conv2d(latent_dim, channels[-1], 3, padding=1)
+        self.dec_mid = nn.Sequential(
+            ResBlock(channels[-1], channels[-1], dropout),
+            ResBlock(channels[-1], channels[-1], dropout),
+        )
         self.dec_blocks = nn.ModuleList()
-        # Encoder produces skips with channels [ch[1], ch[2], ..., ch[-1]]
-        # Decoder processes them in reverse: skip from enc_block[-1-i] has channels[len-1-i]
-        for i in range(len(channels) - 1, 0, -1):
-            skip_ch = channels[i]  # skip from encoder block at this level
-            self.dec_blocks.append(UpBlock(channels[i], skip_ch, channels[i - 1], n_blocks, dropout))
+        in_ch = channels[-1]
+        for i in reversed(range(len(channels))):
+            out_ch = channels[i]
+            self.dec_blocks.append(
+                UpBlock(
+                    in_ch,
+                    out_ch,
+                    n_blocks=n_blocks + 1,
+                    dropout=dropout,
+                    upsample=i > 0,
+                )
+            )
+            in_ch = out_ch
         self.dec_out = nn.Sequential(
-            nn.GroupNorm(min(32, channels[0]), channels[0]),
+            nn.GroupNorm(min(32, channels[0]), channels[0], eps=1e-6),
             nn.SiLU(),
             nn.Conv2d(channels[0], in_channels, 3, padding=1),
         )
@@ -152,12 +186,11 @@ class WeatherVAE(nn.Module):
     def encode(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Encode weather state to latent distribution parameters."""
         h = self.enc_in(x)
-        skips = []
         for block in self.enc_blocks:
-            h, skip = block(h)
-            skips.append(skip)
+            h = block(h)
         h = self.enc_mid(h)
-        return self.to_mu(h), self.to_logvar(h)
+        mu, logvar = self.enc_out(h).chunk(2, dim=1)
+        return mu, logvar.clamp(-30.0, 20.0)
 
     def reparameterize(self, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
         """Sample z = mu + sigma * epsilon."""
@@ -167,13 +200,12 @@ class WeatherVAE(nn.Module):
             return mu + std * eps
         return mu
 
-    def decode(self, z: torch.Tensor, skips: Optional[List[torch.Tensor]] = None) -> torch.Tensor:
+    def decode(self, z: torch.Tensor) -> torch.Tensor:
         """Decode latent tokens back to weather space."""
         h = self.dec_in(z)
         h = self.dec_mid(h)
-        for i, block in enumerate(self.dec_blocks):
-            skip = skips[-(i + 1)] if skips is not None else None
-            h = block(h, skip)
+        for block in self.dec_blocks:
+            h = block(h)
         return self.dec_out(h)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -181,16 +213,9 @@ class WeatherVAE(nn.Module):
         Full forward pass: encode → sample → decode.
         Returns: (reconstruction, z, mu, logvar)
         """
-        h = self.enc_in(x)
-        skips = []
-        for block in self.enc_blocks:
-            h, skip = block(h)
-            skips.append(skip)
-        h = self.enc_mid(h)
-        mu = self.to_mu(h)
-        logvar = self.to_logvar(h)
+        mu, logvar = self.encode(x)
         z = self.reparameterize(mu, logvar)
-        recon = self.decode(z, skips)
+        recon = self.decode(z)
         return recon, z, mu, logvar
 
     def vae_loss(
@@ -211,11 +236,14 @@ class MultiHeadSelfAttention(nn.Module):
     """Standard multi-head self-attention."""
     def __init__(self, dim: int, n_heads: int = 16, dropout: float = 0.1):
         super().__init__()
+        if dim % n_heads != 0:
+            raise ValueError(f"dim ({dim}) must be divisible by n_heads ({n_heads})")
         self.n_heads = n_heads
         self.head_dim = dim // n_heads
         self.qkv = nn.Linear(dim, 3 * dim)
         self.proj = nn.Linear(dim, dim)
-        self.dropout = nn.Dropout(dropout)
+        self.attn_dropout = nn.Dropout(dropout)
+        self.proj_dropout = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, N, C = x.shape
@@ -223,9 +251,9 @@ class MultiHeadSelfAttention(nn.Module):
         q, k, v = qkv.unbind(0)
         attn = (q @ k.transpose(-2, -1)) * (self.head_dim ** -0.5)
         attn = attn.softmax(dim=-1)
-        attn = self.dropout(attn)
+        attn = self.attn_dropout(attn)
         x = (attn @ v).transpose(1, 2).reshape(B, N, C)
-        return self.proj(x)
+        return self.proj_dropout(self.proj(x))
 
 
 class TransformerBlock(nn.Module):
@@ -293,9 +321,19 @@ class MAETransformer(nn.Module):
         # Learnable [MASK] token
         self.mask_token = nn.Parameter(torch.randn(1, 1, hidden_dim) * 0.02)
 
-        # Positional embeddings: spatial + temporal (additive)
-        self.spatial_embed = nn.Parameter(torch.randn(1, max_spatial, hidden_dim) * 0.02)
-        self.temporal_embed = nn.Parameter(torch.randn(1, max_frames, hidden_dim) * 0.02)
+        # The paper adds spatial + temporal embeddings before both MAE stages.
+        self.encoder_spatial_embed = nn.Parameter(
+            torch.randn(1, max_spatial, hidden_dim) * 0.02
+        )
+        self.encoder_temporal_embed = nn.Parameter(
+            torch.randn(1, max_frames, hidden_dim) * 0.02
+        )
+        self.decoder_spatial_embed = nn.Parameter(
+            torch.randn(1, max_spatial, hidden_dim) * 0.02
+        )
+        self.decoder_temporal_embed = nn.Parameter(
+            torch.randn(1, max_frames, hidden_dim) * 0.02
+        )
 
         # Encoder (processes visible tokens only)
         self.encoder = nn.ModuleList([
@@ -312,13 +350,30 @@ class MAETransformer(nn.Module):
         self.encoder_norm = nn.LayerNorm(hidden_dim)
         self.decoder_norm = nn.LayerNorm(hidden_dim)
 
-    def get_pos_embed(self, n_spatial: int, n_frames: int) -> torch.Tensor:
+    def get_pos_embed(
+        self,
+        n_spatial: int,
+        n_frames: int,
+        *,
+        decoder: bool = False,
+    ) -> torch.Tensor:
         """
         Compute combined positional embedding for a sequence of frames.
         Returns shape (1, n_frames * n_spatial, hidden_dim).
         """
-        spatial = self.spatial_embed[:, :n_spatial, :]        # (1, hw, D)
-        temporal = self.temporal_embed[:, :n_frames, :]       # (1, T, D)
+        spatial_table = (
+            self.decoder_spatial_embed if decoder else self.encoder_spatial_embed
+        )
+        temporal_table = (
+            self.decoder_temporal_embed if decoder else self.encoder_temporal_embed
+        )
+        if n_spatial > spatial_table.shape[1] or n_frames > temporal_table.shape[1]:
+            raise ValueError(
+                f"requested {n_frames} frames x {n_spatial} spatial tokens, "
+                "which exceeds the configured positional embeddings"
+            )
+        spatial = spatial_table[:, :n_spatial, :]
+        temporal = temporal_table[:, :n_frames, :]
         # Broadcast add: each frame's tokens get temporal + spatial
         # temporal: (1, T, 1, D), spatial: (1, 1, hw, D) → (1, T, hw, D)
         pos = temporal.unsqueeze(2) + spatial.unsqueeze(1)
@@ -359,29 +414,40 @@ class MAETransformer(nn.Module):
         # Concatenate conditioning + future
         full_seq = torch.cat([cond_h, future_h], dim=1)  # (B, (1+T)*hw, H)
 
-        # Add positional embeddings
-        pos = self.get_pos_embed(n_spatial, n_frames)
-        full_seq = full_seq + pos[:, :full_seq.shape[1], :]
+        # Add the encoder's spatial-temporal positional embeddings.
+        encoder_pos = self.get_pos_embed(n_spatial, n_frames)
+        full_seq = full_seq + encoder_pos[:, :full_seq.shape[1], :]
 
         # --- Encoder: only visible tokens ---
         # Visible = conditioning tokens + unmasked future tokens
         cond_visible = torch.ones(B, n_cond, dtype=torch.bool, device=mask.device)
         full_visible = torch.cat([cond_visible, ~mask], dim=1)  # (B, (1+T)*hw)
 
-        # Gather visible tokens (same set for all batch items if mask is same)
-        visible_indices = full_visible[0].nonzero(as_tuple=False).squeeze(-1)  # assume uniform mask
-        visible_tokens = full_seq[:, visible_indices, :]  # (B, n_vis, H)
+        visible_counts = full_visible.sum(dim=1)
+        if not torch.equal(visible_counts, visible_counts[:1].expand_as(visible_counts)):
+            raise ValueError("each batch item must contain the same number of masked tokens")
+        n_visible = int(visible_counts[0].item())
+        visible_indices = full_visible.nonzero(as_tuple=False)[:, 1].reshape(B, n_visible)
+        visible_tokens = torch.gather(
+            full_seq,
+            1,
+            visible_indices.unsqueeze(-1).expand(-1, -1, self.hidden_dim),
+        )
 
         for block in self.encoder:
             visible_tokens = block(visible_tokens)
         visible_tokens = self.encoder_norm(visible_tokens)
 
         # --- Decoder: full sequence with encoded visible + mask tokens ---
-        # Reconstruct full sequence: place encoded visible tokens back, keep mask tokens
+        # Reconstruct the full sequence, then add decoder positional embeddings.
         decoder_seq = self.mask_token.expand(B, full_seq.shape[1], -1).clone()
-        decoder_seq = decoder_seq + pos[:, :full_seq.shape[1], :]
-        # Scatter encoded visible tokens back
-        decoder_seq[:, visible_indices, :] = visible_tokens
+        decoder_seq.scatter_(
+            1,
+            visible_indices.unsqueeze(-1).expand(-1, -1, self.hidden_dim),
+            visible_tokens,
+        )
+        decoder_pos = self.get_pos_embed(n_spatial, n_frames, decoder=True)
+        decoder_seq = decoder_seq + decoder_pos[:, :full_seq.shape[1], :]
 
         for block in self.decoder:
             decoder_seq = block(decoder_seq)
@@ -389,8 +455,14 @@ class MAETransformer(nn.Module):
 
         # Extract outputs at masked positions (future tokens only)
         # Offset by n_cond since mask is over future tokens
-        masked_indices = mask[0].nonzero(as_tuple=False).squeeze(-1)  # positions in future
-        z_masked = decoder_seq[:, n_cond + masked_indices, :]  # (B, n_masked, H)
+        n_masked = int(mask.sum(dim=1)[0].item())
+        masked_indices = mask.nonzero(as_tuple=False)[:, 1].reshape(B, n_masked)
+        future_output = decoder_seq[:, n_cond:, :]
+        z_masked = torch.gather(
+            future_output,
+            1,
+            masked_indices.unsqueeze(-1).expand(-1, -1, self.hidden_dim),
+        )
 
         # Project back to latent dim
         z_masked = self.output_proj(z_masked)  # (B, n_masked, D_latent)
@@ -508,9 +580,14 @@ class SinusoidalPosEmbed(nn.Module):
     def forward(self, t: torch.Tensor) -> torch.Tensor:
         device = t.device
         half = self.dim // 2
-        freqs = torch.exp(-math.log(10000) * torch.arange(half, device=device) / half)
+        if half == 0:
+            return t.float().unsqueeze(-1)
+        freqs = torch.exp(
+            -math.log(10000) * torch.arange(half, device=device) / max(half - 1, 1)
+        )
         args = t.float().unsqueeze(-1) * freqs.unsqueeze(0)
-        return torch.cat([args.sin(), args.cos()], dim=-1)
+        embedding = torch.cat([args.sin(), args.cos()], dim=-1)
+        return F.pad(embedding, (0, self.dim - embedding.shape[-1]))
 
 
 # =============================================================================
@@ -541,7 +618,7 @@ class DeterministicHead(nn.Module):
 # 5. Diffusion Utilities — linear noise schedule, forward/reverse process
 # =============================================================================
 
-class DiffusionSchedule:
+class DiffusionSchedule(nn.Module):
     """
     Linear noise schedule for the diffusion process.
     
@@ -550,27 +627,24 @@ class DiffusionSchedule:
     Reverse: DDPM-style with temperature τ scaling.
     """
     def __init__(self, n_steps: int = 1000, beta_start: float = 1e-4, beta_end: float = 0.02):
+        super().__init__()
         self.n_steps = n_steps
         betas = torch.linspace(beta_start, beta_end, n_steps)
         alphas = 1.0 - betas
         alpha_bar = torch.cumprod(alphas, dim=0)
+        alpha_bar_prev = F.pad(alpha_bar[:-1], (1, 0), value=1.0)
 
-        self.register = {}
-        self.register['betas'] = betas
-        self.register['alphas'] = alphas
-        self.register['alpha_bar'] = alpha_bar
-        self.register['sqrt_alpha_bar'] = alpha_bar.sqrt()
-        self.register['sqrt_one_minus_alpha_bar'] = (1 - alpha_bar).sqrt()
-
-    def to(self, device: torch.device) -> 'DiffusionSchedule':
-        for k, v in self.register.items():
-            self.register[k] = v.to(device)
-        return self
+        self.register_buffer("betas", betas)
+        self.register_buffer("alphas", alphas)
+        self.register_buffer("alpha_bar", alpha_bar)
+        self.register_buffer("alpha_bar_prev", alpha_bar_prev)
+        self.register_buffer("sqrt_alpha_bar", alpha_bar.sqrt())
+        self.register_buffer("sqrt_one_minus_alpha_bar", (1 - alpha_bar).sqrt())
 
     def q_sample(self, x_0: torch.Tensor, t: torch.Tensor, noise: torch.Tensor) -> torch.Tensor:
         """Forward diffusion: add noise to x_0 at timestep t."""
-        sqrt_ab = self.register['sqrt_alpha_bar'][t].unsqueeze(-1)
-        sqrt_1_ab = self.register['sqrt_one_minus_alpha_bar'][t].unsqueeze(-1)
+        sqrt_ab = self.sqrt_alpha_bar[t].unsqueeze(-1)
+        sqrt_1_ab = self.sqrt_one_minus_alpha_bar[t].unsqueeze(-1)
         return sqrt_ab * x_0 + sqrt_1_ab * noise
 
     def p_sample_step(
@@ -586,9 +660,10 @@ class DiffusionSchedule:
         Eq. (3): x_{s-1} = (1/√α_s)(x_s - (1-α_s)/√(1-ᾱ_s) * ε_θ) + τ * σ_s * δ
         """
         s = t[0].item()
-        alpha_s = self.register['alphas'][s]
-        alpha_bar_s = self.register['alpha_bar'][s]
-        beta_s = self.register['betas'][s]
+        alpha_s = self.alphas[s]
+        alpha_bar_s = self.alpha_bar[s]
+        alpha_bar_prev_s = self.alpha_bar_prev[s]
+        beta_s = self.betas[s]
 
         # Predict noise
         eps_pred = model(x_s, t, z_cond)
@@ -599,7 +674,8 @@ class DiffusionSchedule:
         mean = coeff1 * (x_s - coeff2 * eps_pred)
 
         if s > 0:
-            sigma = beta_s.sqrt()
+            posterior_variance = beta_s * (1 - alpha_bar_prev_s) / (1 - alpha_bar_s)
+            sigma = posterior_variance.clamp_min(0).sqrt()
             noise = torch.randn_like(x_s)
             return mean + tau * sigma * noise
         return mean
@@ -623,13 +699,41 @@ class DiffusionSchedule:
         device = z_cond.device
         B, D = z_cond.shape
 
-        # Resample timesteps if n_steps < training steps
-        step_indices = torch.linspace(self.n_steps - 1, 0, n_steps, device=device).long()
+        if not 1 <= n_steps <= self.n_steps:
+            raise ValueError(f"n_steps must be in [1, {self.n_steps}], got {n_steps}")
 
-        x = torch.randn(B, D, device=device)  # Start from pure noise
-        for idx in step_indices:
-            t = idx.expand(B)
-            x = self.p_sample_step(model, x, t, z_cond, tau)
+        # Choose training-time noise levels, then recompute transition betas for
+        # those levels. Merely skipping DDPM steps does not produce a valid
+        # 100-step reverse process.
+        if n_steps == 1:
+            step_indices = torch.tensor([self.n_steps - 1], device=device)
+        else:
+            step_indices = torch.linspace(
+                0, self.n_steps - 1, n_steps, device=device
+            ).round().long()
+        selected_alpha_bar = self.alpha_bar[step_indices]
+        selected_alpha_bar_prev = F.pad(
+            selected_alpha_bar[:-1], (1, 0), value=1.0
+        )
+        spaced_alphas = selected_alpha_bar / selected_alpha_bar_prev
+        spaced_betas = 1.0 - spaced_alphas
+
+        x = torch.randn(B, D, device=device, dtype=z_cond.dtype)
+        for j in reversed(range(n_steps)):
+            t = step_indices[j].expand(B)
+            eps_pred = model(x, t, z_cond)
+            alpha = spaced_alphas[j]
+            beta = spaced_betas[j]
+            alpha_bar = selected_alpha_bar[j]
+            alpha_bar_prev = selected_alpha_bar_prev[j]
+            mean = alpha.rsqrt() * (
+                x - beta / (1 - alpha_bar).sqrt() * eps_pred
+            )
+            if j > 0:
+                posterior_variance = beta * (1 - alpha_bar_prev) / (1 - alpha_bar)
+                x = mean + tau * posterior_variance.clamp_min(0).sqrt() * torch.randn_like(x)
+            else:
+                x = mean
         return x
 
 
@@ -687,12 +791,16 @@ class OmniCast(nn.Module):
         enc_depth = kwargs.get('encoder_depth', 16)
         dec_depth = kwargs.get('decoder_depth', 16)
         n_heads = kwargs.get('n_heads', 16)
+        mlp_ratio = kwargs.get('mlp_ratio', 4.0)
+        dropout = kwargs.get('dropout', 0.1)
         self.transformer = MAETransformer(
             latent_dim=latent_dim,
             hidden_dim=hidden_dim,
             encoder_depth=enc_depth,
             decoder_depth=dec_depth,
             n_heads=n_heads,
+            mlp_ratio=mlp_ratio,
+            dropout=dropout,
             max_spatial=n_spatial,
             max_frames=1 + n_future_frames,
         )
@@ -706,6 +814,12 @@ class OmniCast(nn.Module):
 
         # Precompute deterministic loss weights (exponentially decaying)
         self._precompute_det_weights()
+
+    def train(self, mode: bool = True) -> "OmniCast":
+        """Keep the stage-one VAE frozen and in evaluation mode."""
+        super().train(mode)
+        self.vae.eval()
+        return self
 
     def _precompute_det_weights(self):
         """Compute per-token exponentially decaying weights for deterministic loss."""
@@ -773,14 +887,14 @@ class OmniCast(nn.Module):
         device = future_tokens.device
         self.diffusion_schedule.to(device)
 
-        # --- Sample mask: ratio γ ~ U[0.5, 1.0], applied to future tokens ---
-        gamma = random.uniform(0.5, 1.0)
-        n_masked = max(1, int(gamma * N))
-        # Random permutation to select which tokens to mask
-        perm = torch.randperm(N, device=device)
-        mask = torch.zeros(N, dtype=torch.bool, device=device)
-        mask[perm[:n_masked]] = True
-        mask = mask.unsqueeze(0).expand(B, -1)  # (B, N) — same mask for the batch
+        # Sample gamma ~ U[0.5, 1.0]. Each example receives an independent
+        # random order across both space and time, with a common packed length.
+        gamma = torch.empty((), device=device).uniform_(0.5, 1.0)
+        n_masked = max(1, int(torch.floor(gamma * N).item()))
+        mask_order = torch.rand(B, N, device=device).argsort(dim=1)
+        masked_indices = mask_order[:, :n_masked]
+        mask = torch.zeros(B, N, dtype=torch.bool, device=device)
+        mask.scatter_(1, masked_indices, True)
 
         # --- Forward through transformer backbone ---
         # z_i at masked positions
@@ -788,8 +902,13 @@ class OmniCast(nn.Module):
         # z_masked: (B, n_masked, D)
 
         # Ground truth tokens at masked positions
-        masked_indices = mask[0].nonzero(as_tuple=False).squeeze(-1)
-        x_target = future_tokens[:, masked_indices, :]  # (B, n_masked, D)
+        # MAETransformer returns masked positions in increasing sequence order.
+        masked_indices = mask.nonzero(as_tuple=False)[:, 1].reshape(B, n_masked)
+        x_target = torch.gather(
+            future_tokens,
+            1,
+            masked_indices.unsqueeze(-1).expand(-1, -1, D),
+        )
 
         # --- Diffusion loss on masked tokens ---
         # Flatten for per-token diffusion: (B*n_masked, D)
@@ -810,9 +929,10 @@ class OmniCast(nn.Module):
         det_residual = (x_det_pred - x_target) ** 2  # (B, n_masked, D)
 
         # Get weights for the masked positions
-        weights = self.det_weights.to(device)[masked_indices]  # (n_masked,)
-        # Weight per token, averaged over D
-        det_loss = (det_residual.mean(dim=-1) * weights.unsqueeze(0)).sum() / max(weights.sum(), 1e-8)
+        weights = self.det_weights[masked_indices]
+        # w(i) is normalized once across the first ten frames, as in Appendix
+        # A.2; it is not renormalized to whichever positions happened to mask.
+        det_loss = (det_residual.mean(dim=-1) * weights).sum(dim=1).mean()
 
         loss = diff_loss + det_loss
 
@@ -858,46 +978,43 @@ class OmniCast(nn.Module):
 
         # Initialize all future tokens as zeros (will be replaced by generated tokens)
         future_tokens = torch.zeros(B, N, D, device=device)
-        # Track which tokens are still masked
-        is_masked = torch.ones(N, dtype=torch.bool, device=device)
+        # Every ensemble member receives an independent random unmasking order.
+        is_masked = torch.ones(B, N, dtype=torch.bool, device=device)
 
         # Cosine schedule: determines how many tokens to unmask at each iteration
         # γ(t) goes from 1.0 → 0.0 following cos schedule
         for i in range(n_iter):
-            # Current and next mask ratios (cosine schedule, Eq. from MaskGIT)
-            ratio_now = math.cos(math.pi / 2 * i / n_iter)
+            # Target remaining tokens under the MaskGIT cosine schedule.
             ratio_next = math.cos(math.pi / 2 * (i + 1) / n_iter)
-            # Number of tokens to unmask this iteration
-            n_to_unmask = max(1, int((ratio_now - ratio_next) * N))
-
-            # Select which masked tokens to unmask (random ordering)
-            masked_indices = is_masked.nonzero(as_tuple=False).squeeze(-1)
-            if len(masked_indices) == 0:
+            n_remaining = int(is_masked[0].sum().item())
+            if n_remaining == 0:
                 break
-            n_to_unmask = min(n_to_unmask, len(masked_indices))
-            # If last iteration, unmask all remaining
-            if i == n_iter - 1:
-                n_to_unmask = len(masked_indices)
-            perm = torch.randperm(len(masked_indices), device=device)
-            selected = masked_indices[perm[:n_to_unmask]]
+            target_remaining = int(math.floor(ratio_next * N))
+            n_to_unmask = n_remaining - target_remaining
+            if n_to_unmask <= 0:
+                continue
 
-            # Build mask for transformer (True = still masked)
-            mask = is_masked.unsqueeze(0).expand(B, -1)
+            # Random positions are selected separately for each batch member.
+            random_scores = torch.rand(B, N, device=device)
+            random_scores = random_scores.masked_fill(~is_masked, float("inf"))
+            selected = random_scores.argsort(dim=1)[:, :n_to_unmask]
 
             # Forward through transformer
-            z_masked = self.transformer(cond_tokens, future_tokens, mask, self.n_spatial)
+            z_masked = self.transformer(
+                cond_tokens, future_tokens, is_masked, self.n_spatial
+            )
             # z_masked: (B, n_currently_masked, D)
 
-            # Map selected indices to positions within the masked set
-            all_masked = is_masked.nonzero(as_tuple=False).squeeze(-1)
-            # Find which positions in z_masked correspond to our selected tokens
-            mask_pos_map = {idx.item(): pos for pos, idx in enumerate(all_masked)}
-            selected_positions = torch.tensor(
-                [mask_pos_map[s.item()] for s in selected], device=device
+            # Transformer outputs masked positions in increasing token order.
+            rank_within_mask = is_masked.long().cumsum(dim=1) - 1
+            selected_positions = torch.gather(
+                rank_within_mask, 1, selected
             )
-
-            # Extract z_i for selected tokens
-            z_selected = z_masked[:, selected_positions, :]  # (B, n_to_unmask, D)
+            z_selected = torch.gather(
+                z_masked,
+                1,
+                selected_positions.unsqueeze(-1).expand(-1, -1, D),
+            )
 
             # Diffusion sampling for each selected token
             z_flat = z_selected.reshape(B * n_to_unmask, D)
@@ -906,11 +1023,79 @@ class OmniCast(nn.Module):
             )
             sampled = sampled.reshape(B, n_to_unmask, D)
 
-            # Place generated tokens
-            future_tokens[:, selected, :] = sampled
-            is_masked[selected] = False
+            # Place generated tokens and reveal them for the next iteration.
+            future_tokens.scatter_(
+                1, selected.unsqueeze(-1).expand(-1, -1, D), sampled
+            )
+            is_masked.scatter_(1, selected, False)
 
         return future_tokens
+
+    @torch.no_grad()
+    def generate_ensemble(
+        self,
+        cond_tokens: torch.Tensor,
+        ensemble_size: int = 50,
+        **generate_kwargs,
+    ) -> torch.Tensor:
+        """
+        Generate independent ensemble members by replicating each initial state.
+
+        Returns:
+            Tensor of shape (B, ensemble_size, T*hw, D).
+        """
+        if ensemble_size < 1:
+            raise ValueError("ensemble_size must be positive")
+        B = cond_tokens.shape[0]
+        replicated = cond_tokens.repeat_interleave(ensemble_size, dim=0)
+        samples = self.generate(replicated, **generate_kwargs)
+        return samples.reshape(B, ensemble_size, samples.shape[1], samples.shape[2])
+
+    @torch.no_grad()
+    def generate_autoregressive(
+        self,
+        cond_tokens: torch.Tensor,
+        n_frames: int,
+        *,
+        tau: float = 1.0,
+        n_iterations: int = 1,
+        diffusion_steps: Optional[int] = None,
+    ) -> torch.Tensor:
+        """
+        Medium-range rollout used in Section 5.2 of the paper.
+
+        The medium-range model predicts two 12-hour frames per call. The most
+        recent predicted frame becomes the next initial condition until the
+        requested horizon is reached.
+
+        Returns:
+            Tensor of shape (B, n_frames, hw, D).
+        """
+        if n_frames < 1:
+            raise ValueError("n_frames must be positive")
+
+        chunks = []
+        current_condition = cond_tokens
+        generated_count = 0
+        while generated_count < n_frames:
+            window = self.generate(
+                current_condition,
+                n_iterations=n_iterations,
+                tau=tau,
+                diffusion_steps=diffusion_steps,
+            )
+            window = window.reshape(
+                window.shape[0],
+                self.n_future_frames,
+                self.n_spatial,
+                self.latent_dim,
+            )
+            n_take = min(self.n_future_frames, n_frames - generated_count)
+            chunks.append(window[:, :n_take])
+            generated_count += n_take
+            current_condition = window[:, -1]
+
+        return torch.cat(chunks, dim=1)
 
 
 # =============================================================================
@@ -955,7 +1140,7 @@ def example_training():
         vae_optimizer.zero_grad()
         loss.backward()
         vae_optimizer.step()
-        print(f"  VAE Epoch {epoch}: loss={loss.item():.4f}, latent shape={z.shape} → h={h}, w={w}")
+        print(f"  VAE Epoch {epoch}: loss={loss.item():.4f}, latent shape={z.shape} -> h={h}, w={w}")
 
     # =============================
     # Stage 2: Train OmniCast
@@ -1012,23 +1197,25 @@ def example_inference(model: OmniCast, h: int, w: int):
     """
     device = next(model.parameters()).device
     V = model.vae.enc_in.in_channels
-    H = h * (2 ** (len(model.vae.enc_blocks)))  # reconstruct original spatial dims
-    W = w * (2 ** (len(model.vae.enc_blocks)))
+    n_downsamples = sum(block.downsample is not None for block in model.vae.enc_blocks)
+    H = h * (2 ** n_downsamples)
+    W = w * (2 ** n_downsamples)
 
     print("\n=== Inference: Iterative Unmasking ===")
 
-    # Encode initial condition
-    x0 = torch.randn(2, 1, V, H, W, device=device)  # 2 ensemble members
-    ic_tokens = model.encode_frames(x0)[:, 0, :, :]  # (2, h*w, D)
+    # Encode one initial condition, then independently sample two members.
+    x0 = torch.randn(1, 1, V, H, W, device=device)
+    ic_tokens = model.encode_frames(x0)[:, 0, :, :]  # (1, h*w, D)
 
     # Generate future tokens via iterative unmasking
     model.eval()
-    future_tokens = model.generate(
+    future_tokens = model.generate_ensemble(
         cond_tokens=ic_tokens,
+        ensemble_size=2,
         n_iterations=model.n_future_frames,  # 1 iteration per frame
         tau=1.3,                              # temperature from paper
         diffusion_steps=20,
-    )
+    )[0]
     print(f"  Generated future tokens shape: {future_tokens.shape}")
     # future_tokens: (2, T*h*w, D)
 
