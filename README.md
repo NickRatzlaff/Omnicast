@@ -1,240 +1,349 @@
-# OmniCast Summary
+# OmniCast
 
-This repository contains a compact PyTorch implementation of **OmniCast**, based on:
+This directory contains a compact PyTorch implementation of:
 
-- Tung Nguyen, Tuan Pham, Troy Arcomano, Veerabhadra Kotamarthi, Ian Foster, Sandeep Madireddy, and Aditya Grover, **"OmniCast: A Masked Latent Diffusion Model for Weather Forecasting Across Time Scales"**, NeurIPS 2025
-- Paper: https://arxiv.org/abs/2510.18707
-- Local implementation: `omnicast/omnicast.py`
+> Tung Nguyen, Tuan Pham, Troy Arcomano, Veerabhadra Kotamarthi, Ian Foster,
+> Sandeep Madireddy, and Aditya Grover, “OmniCast: A Masked Latent Diffusion
+> Model for Weather Forecasting Across Time Scales,” NeurIPS 2025.
 
-This README summarizes:
+- Paper: <https://arxiv.org/abs/2510.18707>
+- Implementation: [`omnicast.py`](omnicast.py)
 
-1. The evaluation setup and headline results reported in the paper
-2. The model pipeline as implemented in this repository
-3. Where this code matches the paper and where it is intentionally simplified
+The code follows the paper's two-stage design: a continuous VAE compresses each
+weather state independently, then an MAE-style Transformer and per-token
+diffusion head jointly model future latent states across space and time.
 
-## What OmniCast Tries to Do
+This is a paper-aligned, self-contained implementation, not a complete
+reproduction package. It does not include ERA5 data preparation, benchmark
+evaluation code, pretrained weights, or the distributed training infrastructure
+used for the reported results.
 
-OmniCast is a **probabilistic weather forecasting model** designed to work across both:
+## Requirements
 
-- **medium-range forecasting**
-- **subseasonal-to-seasonal (S2S) forecasting**
+- Python 3.10+
+- PyTorch
+- einops
 
-The core idea is to avoid the error accumulation of standard autoregressive rollouts by:
+Install the two runtime dependencies with:
 
-- compressing weather states into a continuous latent space with a VAE
-- predicting many future latent tokens jointly with a masked transformer
-- using a per-token diffusion model to sample the masked latent tokens
+```bash
+pip install torch einops
+```
 
-## Datasets and Benchmarks Used in the Paper
+From the project root, run the reduced synthetic example with:
 
-The paper evaluates OmniCast on **69 ERA5 variables** and uses two benchmark settings.
+```powershell
+.\env\Scripts\python.exe .\omnicast\omnicast.py
+```
 
-### 1. WeatherBench2 for medium-range forecasting
+The example trains a small VAE, performs several stage-two optimization steps,
+generates two independent ensemble members, and decodes them into weather
+fields. It is a behavioral demonstration rather than a meaningful forecast.
 
-- Dataset source: **ERA5 reanalysis**
-- Resolution: the paper says the medium-range setting uses the **native WeatherBench2 resolution**
-- Split: **train 1979-2018**, **val 2019**, **test 2020**
-- Initializations: **00 UTC and 12 UTC**
-- Main metrics: **ensemble RMSE**, **CRPS**, **spread-skill ratio (SSR)**
+## Architecture
 
-### 2. ChaosBench for S2S forecasting
+### 1. Continuous weather VAE
 
-- Dataset source: **ERA5 reanalysis**
-- Resolution: downsampled global grids for the S2S setup
-- Split: **train 1979-2020**, **val 2021**, **test 2022**
-- Initializations: **00 UTC**
-- Lead times: roughly **2 to 6 weeks**; the implementation comments point to **44 future frames**
-- Main target variables highlighted in the paper: **T850**, **Z500**, **Q700**
-- Main metrics:
-- Deterministic: **RMSE**, **absolute bias**, **multi-scale SSIM**
-- Physics-based: **spectral divergence (SDIV)** and **spectral residual (SRES)**
-- Probabilistic: **CRPS** and **SSR**
+`WeatherVAE` embeds each frame independently:
 
-### ERA5 variables used
+```text
+(B, V, H, W) -> (B, D, h, w) -> (B, V, H, W)
+```
 
-The paper states that training/evaluation use **69 variables** from ERA5:
+The default S2S configuration follows Appendix A.1 of the paper:
 
-- 4 surface variables: **2m temperature (T2m)**, **10m U wind (U10)**, **10m V wind (V10)**, and **mean sea-level pressure (MSLP)**
-- 5 atmospheric variables across 13 pressure levels: **geopotential (Z)**, **temperature (T)**, **U wind**, **V wind**, and **specific humidity (Q)**
+| Setting | Default |
+| --- | ---: |
+| Input/output variables | 69 |
+| Base channels | 256 |
+| Channel multipliers | `(1, 2, 4, 4, 8)` |
+| Residual blocks per encoder level | 2 |
+| Latent channels | 1024 |
+| Spatial downsampling | 16x |
+| Dropout | 0.0 |
+| KL weight | `5e-5` |
 
-## Paper-Reported Evaluation Results
+The encoder and decoder use PDEArena/LDM-style pre-normalized residual blocks.
+The decoder reconstructs weather fields from the latent tensor alone; it does
+not receive encoder skip connections. This is necessary because generated
+latents have no corresponding encoder features at inference time.
 
-### S2S results on ChaosBench
+For the paper's S2S data, a `69 x 128 x 256` frame becomes a
+`1024 x 8 x 16` latent map, or 128 continuous tokens.
 
-The paper's main claim is that OmniCast is strongest at the **subseasonal-to-seasonal timescale**.
+### 2. MAE encoder-decoder Transformer
 
-Reported takeaways:
+`MAETransformer` processes initial-condition tokens and partially visible
+future tokens.
 
-- OmniCast achieves **state-of-the-art S2S performance** across deterministic, physics-based, and probabilistic metrics
-- On deterministic metrics, it is a little weaker at short lead times, but its relative performance improves as lead time grows
-- Beyond the later lead-time regime, the paper says OmniCast becomes one of the **top two** methods and **matches ECMWF-ENS** on deterministic performance
-- OmniCast shows the **lowest bias** among compared baselines, staying near zero across the target variables
-- On physics-based metrics, the paper says OmniCast is **substantially better than other deep learning methods** and often better than all baselines
-- On probabilistic metrics, the paper says **OmniCast and ECMWF-ENS are the two leading methods** across variables and lead times
-- The paper also states that OmniCast **outperforms ECMWF-ENS beyond longer lead times** on the probabilistic side after trailing it earlier in the forecast
+- A mask ratio `gamma ~ U[0.5, 1.0]` is sampled during training.
+- Random masks span both spatial and temporal positions.
+- Each batch item receives an independent random mask with the same packed
+  token count.
+- The encoder sees the initial-condition tokens and visible future tokens.
+- The decoder receives encoded visible tokens plus learnable `[MASK]` tokens.
+- Separate spatial-plus-temporal positional embeddings are added before the
+  encoder and decoder.
+- Both stages use bidirectional full self-attention.
 
-In short, the paper positions OmniCast as especially strong when the forecasting horizon becomes long enough that autoregressive error accumulation starts to dominate competing deep learning systems.
+Paper-scale Transformer defaults are:
 
-### Medium-range results on WeatherBench2
+| Setting | Default |
+| --- | ---: |
+| Hidden dimension | 1024 |
+| Encoder depth | 16 |
+| Decoder depth | 16 |
+| Attention heads | 16 |
+| MLP expansion | 4x |
+| Dropout | 0.1 |
 
-For medium-range forecasting, the paper compares OmniCast to:
+### 3. Per-token diffusion head
 
-- **GenCast**
-- **IFS-ENS**
+`DiffusionHead` models each masked continuous token conditioned on its
+Transformer representation.
 
-Reported takeaways:
+- Input: noisy latent token, diffusion timestep, and Transformer output
+  `z_i`.
+- Network: six residual MLP blocks of width 2048.
+- Each block uses adaptive LayerNorm conditioning from `z_i` and the timestep
+  embedding.
+- Objective: MSE between predicted and sampled Gaussian noise.
 
-- OmniCast is **competitive at medium range**
-- It performs **comparably to IFS-ENS**
-- It is **slightly behind GenCast**
-- The abstract states that OmniCast is roughly **10x to 20x faster** than leading probabilistic methods at the medium-range timescale
-
-So the paper's overall message is:
-
-- OmniCast is not mainly optimized to be the absolute best short-horizon model
-- but it remains strong at medium range
-- and its design becomes especially valuable at S2S horizons
-
-### Efficiency findings
-
-The paper emphasizes efficiency as a major advantage:
-
-- training reported as **4 days on 32 NVIDIA A100 GPUs**
-- compared against heavier baselines such as GenCast and NeuralGCM
-- inference described as **orders of magnitude faster** than GenCast, NeuralGCM, and IFS-ENS
-
-The paper attributes that speedup to two choices:
-
-- forecasting in a **compressed latent space**
-- doing expensive iterative sampling only in the **small diffusion head**, not through the full transformer each diffusion step
-
-### Ablation findings reported in the paper
-
-The paper highlights four main ablations:
-
-#### 1. Auxiliary deterministic loss
-
-- Removing the MSE objective hurts both RMSE and CRPS
-- Applying MSE to **all** future frames also hurts
-- The best setting is to apply deterministic supervision only to the **first 10 future frames**
-
-#### 2. Training sequence length
-
-- Shorter sequences or smaller step sizes help short-range behavior
-- Full-sequence training performs better at S2S horizons because it reduces long-horizon error accumulation
-
-#### 3. Unmasking order
-
-- A fully randomized unmasking strategy works better than framewise alternatives
-- The paper says this improves ensemble diversity and SSR
-
-#### 4. Diffusion temperature
-
-- Low temperature gives under-dispersive ensembles
-- Very high temperature hurts RMSE and CRPS
-- The paper reports **tau = 1.3** as the best balance
-
-## Model Pipeline
-
-The implementation in `omnicast/omnicast.py` follows the same high-level two-stage pipeline described in the paper.
-
-### Stage 1: Compress each weather frame with a VAE
-
-`WeatherVAE` is a UNet-style continuous VAE.
-
-- Input: one weather frame with many channels and variables
-- Encoder: convolution plus residual downsampling blocks
-- Latent: a spatial grid of continuous latent vectors
-- Decoder: upsamples latent grids back into weather fields
-- Loss: reconstruction MSE plus KL penalty
-
-Why this matters:
-
-- forecasting directly in raw weather space is expensive
-- forecasting in a compressed latent space makes long sequences feasible
-
-### Stage 2: Predict future latent tokens with masked generative modeling
-
-After the VAE is trained, the model freezes it and works in latent-token space.
-
-- The initial condition frame is encoded into conditioning tokens
-- Future frames are encoded into target latent tokens during training
-- A random subset of future tokens is masked
-- The transformer sees conditioning tokens, visible future tokens, and `[MASK]` tokens in masked future positions
-
-The backbone is `MAETransformer`, which acts like an encoder-decoder masked transformer:
-
-- the encoder processes only visible tokens
-- the decoder reconstructs a full token sequence including masked locations
-- the outputs at masked positions become conditioning vectors for token generation
-
-### Per-token diffusion head
-
-Each masked token is modeled as a continuous random variable.
-
-Instead of predicting a discrete codebook ID, OmniCast uses `DiffusionHead`:
-
-- input: noisy token plus diffusion timestep plus transformer conditioning vector
-- network: small MLP with AdaLN-style conditioning
-- target: predict the diffusion noise for that token
-
-This lets the model generate continuous latent tokens without vector quantization.
-
-### Auxiliary deterministic head
-
-The implementation includes `DeterministicHead`, an MLP that directly predicts masked latent tokens.
-
-Its role is to stabilize short-range forecasts:
-
-- only early future frames receive this deterministic supervision
-- the weights decay exponentially with lead time
-
-This directly reflects one of the paper's most important ablation findings.
-
-### Inference by iterative unmasking
-
-Generation starts with **all future tokens masked**.
-
-Then the model repeats:
-
-1. Run the transformer on conditioning tokens plus the current partially filled future sequence
-2. Choose some masked positions to reveal
-3. Sample those positions with the diffusion head
-4. Write them back into the sequence
-
-The implementation uses:
-
-- a **cosine mask schedule**
-- **random token order**
-- configurable diffusion steps
-- configurable diffusion temperature
-
-This is the key mechanism that replaces standard autoregressive frame-by-frame rollout.
-
-## How This Repository Maps to the Paper
-
-This repo is best read as a **clean educational implementation**, not a full reproduction package.
-
-What it captures well:
-
-- continuous VAE latent compression
-- masked transformer over conditioning plus future tokens
-- per-token diffusion sampling
-- auxiliary deterministic head for early frames
-- iterative unmasking inference
-
-What is simplified in this repo:
-
-- there are **no ERA5, WeatherBench2, or ChaosBench data loaders**
-- there are **no official training scripts or checkpoints**
-- `example_training()` uses **synthetic random tensors**
-- the example uses much smaller dimensions than the paper
-- several comments explicitly note paper settings versus demo settings
-
-Examples of paper-vs-demo differences already called out in the code:
-
-- paper: **69 variables**; demo: **8**
-- paper: latent dim **1024**; demo: **64**
-- paper: **44** future frames; demo: **6**
-- paper transformer depth: **16/16**; demo: **2/2**
-- paper diffusion steps: **1000 train / 100 infer**; demo: **100 / 20**
+`DiffusionSchedule` uses 1000 linear training noise levels by default. Inference
+uses 100 levels by default and mathematically respaces the DDPM transitions.
+It does not simply skip one-step transitions from the original schedule.
+Temperature `tau` scales the reverse-process noise.
+
+The paper specifies a linear schedule but not its endpoints; this implementation
+uses the conventional `beta_start=1e-4` and `beta_end=0.02`.
+
+### 4. Auxiliary deterministic head
+
+`DeterministicHead` directly predicts masked latent tokens from `z_i`.
+
+Following Appendix A.2:
+
+- only the first 10 future frames receive deterministic supervision;
+- frame `k` receives weight `exp(-k)`;
+- all applicable token weights are normalized once to sum to one;
+- masked weights are not renormalized after mask sampling.
+
+The complete stage-two loss is:
+
+```text
+loss = diffusion_loss + deterministic_loss
+```
+
+### 5. Iterative generation
+
+`OmniCast.generate()` starts with every future position masked. At each
+iteration it:
+
+1. runs the MAE Transformer on the current partially generated sequence;
+2. follows a cosine schedule to determine how many positions to reveal;
+3. independently chooses random positions for every batch member;
+4. samples those tokens with the per-token diffusion head;
+5. inserts the samples into the future sequence.
+
+The default S2S configuration generates 44 daily future frames in 44 unmasking
+iterations with `tau=1.3`.
+
+## Tensor Shapes
+
+The public methods use the following layouts:
+
+| Method | Input | Output |
+| --- | --- | --- |
+| `WeatherVAE.forward` | `(B, V, H, W)` | reconstruction, sample, mean, log-variance |
+| `OmniCast.encode_frames` | `(B, T, V, H, W)` | `(B, T, h*w, D)` |
+| `OmniCast.decode_tokens` | `(B, T, h*w, D)` | `(B, T, V, H, W)` |
+| `OmniCast.training_step` | condition `(B, h*w, D)`, future `(B, T*h*w, D)` | loss dictionary |
+| `OmniCast.generate` | `(B, h*w, D)` | `(B, T*h*w, D)` |
+| `OmniCast.generate_ensemble` | `(B, h*w, D)` | `(B, E, T*h*w, D)` |
+| `OmniCast.generate_autoregressive` | `(B, h*w, D)` | `(B, requested_frames, h*w, D)` |
+
+Latent tokens are flattened frame-major: all spatial tokens for frame 0,
+followed by all spatial tokens for frame 1, and so on.
+
+## Two-Stage Training
+
+### Stage 1: train the VAE
+
+```python
+import torch
+from omnicast.omnicast import WeatherVAE
+
+vae = WeatherVAE()
+optimizer = torch.optim.Adam(
+    vae.parameters(),
+    lr=2e-4,
+    betas=(0.9, 0.95),
+    weight_decay=1e-5,
+)
+
+weather = torch.randn(2, 69, 128, 256)
+reconstruction, latent, mean, logvar = vae(weather)
+loss = vae.vae_loss(
+    weather,
+    reconstruction,
+    mean,
+    logvar,
+    kl_weight=5e-5,
+)
+
+optimizer.zero_grad()
+loss.backward()
+optimizer.step()
+```
+
+The paper trains this stage for 200 epochs with batch size 32, 20 epochs of
+linear warmup, and cosine decay over the remaining 180 epochs. The example in
+`omnicast.py` intentionally uses a much smaller model and synthetic tensors.
+
+### Stage 2: train OmniCast in latent space
+
+```python
+from einops import rearrange
+from omnicast.omnicast import OmniCast
+
+model = OmniCast(vae=vae)
+optimizer = torch.optim.AdamW(
+    (parameter for parameter in model.parameters() if parameter.requires_grad),
+    lr=2e-4,
+    betas=(0.9, 0.95),
+    weight_decay=1e-5,
+)
+
+# frames: (B, 45, 69, 128, 256), consisting of one IC and 44 targets
+all_tokens = model.encode_frames(frames)
+condition = all_tokens[:, 0]
+future = rearrange(all_tokens[:, 1:], "b t n d -> b (t n) d")
+
+losses = model.training_step(condition, future)
+optimizer.zero_grad()
+losses["loss"].backward()
+optimizer.step()
+```
+
+The VAE is frozen by `OmniCast` and remains in evaluation mode even when
+`model.train()` is called. The paper trains stage two for 100 epochs with batch
+size 32, 10 warmup epochs, and cosine decay over the remaining 90 epochs.
+
+Paper-scale tensors and models require substantial accelerator memory; the code
+above documents the interface and is not expected to fit on a typical CPU or
+consumer GPU.
+
+## S2S Ensemble Inference
+
+The paper creates an ensemble by replicating each initial condition and
+independently sampling every copy. `generate_ensemble()` implements that
+behavior directly:
+
+```python
+# initial_frame: (B, 1, 69, 128, 256)
+condition = model.encode_frames(initial_frame)[:, 0]
+
+ensemble_tokens = model.generate_ensemble(
+    condition,
+    ensemble_size=50,
+    n_iterations=44,
+    diffusion_steps=100,
+    tau=1.3,
+)
+# (B, 50, 44*128, 1024)
+```
+
+Each member receives independent diffusion noise and an independent random
+unmasking order. To decode one batch item:
+
+```python
+members = ensemble_tokens[0].reshape(50, 44, 128, 1024)
+forecasts = model.decode_tokens(members, h=8, w=16)
+# (50, 44, 69, 128, 256)
+```
+
+## Medium-Range Rollout
+
+Section 5.2 uses a separate medium-range configuration:
+
+- native `69 x 721 x 1440` weather fields;
+- `256 x 45 x 90` latent maps;
+- two predicted frames per call at 12-hour intervals;
+- autoregressive rollout using the most recent predicted frame;
+- one unmasking iteration per prediction window;
+- diffusion temperature `tau=1.0`.
+
+Configure a separate model with `latent_dim=256`, `n_spatial=45*90`, and
+`n_future_frames=2`, then call:
+
+```python
+rollout = medium_range_model.generate_autoregressive(
+    condition,
+    n_frames=30,       # 15 days at 12-hour intervals
+    n_iterations=1,
+    diffusion_steps=100,
+    tau=1.0,
+)
+# (B, 30, 45*90, 256)
+```
+
+The latent rollout method is implemented, but this compact VAE does not include
+the official medium-range model's special `721 -> 720 -> 721` row adapter.
+Four downsampling stages map a 721-row input to 45 latent rows, while the
+decoder naturally reconstructs 720 rows. Native WeatherBench2 decoding
+therefore requires an equivalent input/output row adapter or preprocessing to
+an even 720-row grid.
+
+## Paper Evaluation Setup
+
+The paper trains and evaluates on 69 ERA5 variables:
+
+- four surface variables: T2m, U10, V10, and MSLP;
+- geopotential, temperature, U wind, V wind, and specific humidity at 13
+  pressure levels.
+
+The S2S experiment uses ChaosBench at `128 x 256` resolution, trains on
+1979-2020, validates on 2021, and tests on 2022. It forecasts days 1-44 from
+00 UTC initializations.
+
+The medium-range experiment uses WeatherBench2 at `721 x 1440`, trains on
+1979-2018, validates on 2019, and tests on 2020 using 00 UTC and 12 UTC
+initializations.
+
+These datasets, splits, normalization statistics, metrics, and evaluation
+pipelines are described here for context but are not included in this
+repository.
+
+## Paper Defaults vs. Included Demo
+
+| Setting | Paper S2S model | Built-in demo |
+| --- | ---: | ---: |
+| Weather variables | 69 | 8 |
+| Input resolution | `128 x 256` | `32 x 64` |
+| Latent channels | 1024 | 64 |
+| Future frames | 44 | 6 |
+| Transformer depth | 16 encoder / 16 decoder | 2 / 2 |
+| Attention heads | 16 | 4 |
+| Diffusion levels | 1000 train / 100 infer | 100 / 20 |
+| VAE/channel training data | ERA5 | random tensors |
+
+## Reproduction Limitations
+
+The implementation captures the model mechanics described in the paper,
+including latent-only VAE decoding, independent random masks, MAE
+encoder-decoder processing, weighted near-term supervision, respaced diffusion,
+cosine iterative unmasking, ensemble replication, and medium-range
+autoregression.
+
+Exact paper results additionally require:
+
+- ERA5 acquisition, variable ordering, normalization, and temporal sampling;
+- WeatherBench2 and ChaosBench evaluation code;
+- the full learning-rate schedules and distributed mixed-precision trainer;
+- trained VAE and OmniCast checkpoints;
+- the native WeatherBench2 721-row VAE input/output adapter;
+- the paper's accelerator scale and ensemble evaluation setup.
+
+Because those components are absent, successful execution of this script
+validates architecture and tensor flow, not the forecast scores reported in the
+paper.
